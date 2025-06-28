@@ -86,3 +86,109 @@
         (ok (map-set balances 
             tx-sender 
             { stx-balance: (+ current-balance amount) }))))
+
+
+;; Withdraw collateral
+(define-public (withdraw-collateral (amount uint))
+    (let ((current-balance (get stx-balance (get-balance tx-sender))))
+        (asserts! (>= current-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        (ok (map-set balances 
+            tx-sender 
+            { stx-balance: (- current-balance amount) }))))
+
+;; Open position
+(define-public (open-position 
+    (position-type uint)
+    (size uint)
+    (leverage uint))
+    (let 
+        ((required-collateral (/ (* size (var-get current-price)) leverage))
+         (current-balance (get stx-balance (get-balance tx-sender)))
+         (position-id (+ (var-get position-counter) u1))
+         (entry-price (var-get current-price)))
+
+        ;; Verify conditions
+        (asserts! (or (is-eq position-type TYPE-LONG) 
+                     (is-eq position-type TYPE-SHORT)) ERR-INVALID-POSITION)
+        (asserts! (>= current-balance required-collateral) ERR-INSUFFICIENT-COLLATERAL)
+
+        ;; Calculate liquidation price
+        (let ((liquidation-price (unwrap! (calculate-liquidation-price 
+                                         entry-price 
+                                         position-type 
+                                         leverage) ERR-INVALID-POSITION)))
+
+            ;; Create position
+            (map-set positions position-id
+                { owner: tx-sender,
+                  position-type: position-type,
+                  size: size,
+                  entry-price: entry-price,
+                  leverage: leverage,
+                  collateral: required-collateral,
+                  liquidation-price: liquidation-price })
+
+            ;; Update balance
+            (map-set balances 
+                tx-sender 
+                { stx-balance: (- current-balance required-collateral) })
+
+            ;; Increment position counter
+            (var-set position-counter position-id)
+            (ok position-id))))
+
+;; Close position
+(define-public (close-position (position-id uint))
+    (let ((position (unwrap! (get-position position-id) ERR-INVALID-POSITION)))
+        ;; Verify owner
+        (asserts! (is-eq (get owner position) tx-sender) ERR-UNAUTHORIZED)
+
+        ;; Calculate PnL
+        (let ((pnl (calculate-pnl position)))
+            ;; Return collateral + PnL
+            (try! (as-contract 
+                   (stx-transfer? 
+                    (+ (get collateral position) pnl) 
+                    tx-sender 
+                    tx-sender)))
+
+            ;; Delete position
+            (map-delete positions position-id)
+            (ok true))))
+
+;; -----------------------------
+;; Private Functions
+;; -----------------------------
+
+;; Calculate PnL (simplified)
+(define-private (calculate-pnl (position {owner: principal, 
+                                        position-type: uint,
+                                        size: uint,
+                                        entry-price: uint,
+                                        leverage: uint,
+                                        collateral: uint,
+                                        liquidation-price: uint}))
+    (let ((current-price-local (var-get current-price))
+          (price-diff (if (is-eq (get position-type position) TYPE-LONG)
+                         (- current-price-local (get entry-price position))
+                         (- (get entry-price position) current-price-local))))
+        (* price-diff (get size position))))
+
+;; -----------------------------
+;; Admin Functions
+;; -----------------------------
+
+;; Update price (would be replaced by oracle in production)
+(define-public (update-price (new-price uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (var-set current-price new-price)
+        (ok true)))
+
+;; Update contract owner
+(define-public (set-contract-owner (new-owner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-UNAUTHORIZED)
+        (var-set contract-owner new-owner)
+        (ok true)))
